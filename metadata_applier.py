@@ -3,9 +3,9 @@
 Metadata Applier from CSV → Media Files (cross‑platform)
 
 Features:
-- Reads a CSV with columns: Filename, Title, Keywords
+- Reads a CSV with columns: Filename, Title, Keywords, Description
 - Matches files in a target directory (exact and case-insensitive fallback)
-- Writes metadata using exiftool: Title and Keywords
+- Writes metadata using exiftool: Title, Keywords, and Description
 - Supports dry-run, custom CSV encoding, and custom exiftool path
 - Clear reporting summary at the end
 
@@ -55,8 +55,8 @@ def build_keywords_args(keywords_str: str) -> List[str]:
     return [f"-Keywords={k}" for k in raw if k]
 
 
-def run_exiftool(exiftool: str, file_path: Path, title: str | None, keywords: str | None, dry_run: bool) -> Tuple[bool, str]:
-    """Invoke exiftool to write Title and Keywords. Returns (ok, message)."""
+def run_exiftool(exiftool: str, file_path: Path, title: str | None, keywords: str | None, description: str | None, dry_run: bool) -> Tuple[bool, str]:
+    """Invoke exiftool to write Title, Keywords, and Description. Returns (ok, message)."""
     args = [exiftool]
 
     # Prefer explicit XMP where sensible; exiftool will map generically if tag is available
@@ -72,6 +72,11 @@ def run_exiftool(exiftool: str, file_path: Path, title: str | None, keywords: st
         # exiftool supports -Subject= for XMP:Subject
         subject_args = [a.replace("-Keywords=", "-Subject=") for a in kw_args]
         args.extend(subject_args)
+
+    if description:
+        args.append(f"-Description={description}")
+        # Also set XMP:Description for broader compatibility
+        args.append(f"-XMP:Description={description}")
 
     # Overwrite in place; exiftool writes a _original backup unless told otherwise
     args.extend(["-overwrite_original", str(file_path)])
@@ -91,8 +96,8 @@ def run_exiftool(exiftool: str, file_path: Path, title: str | None, keywords: st
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Apply Title and Keywords metadata to files based on a CSV.")
-    p.add_argument("--csv", required=False, help="Path to the CSV file (columns: Filename, Title, Keywords). If omitted, will auto-detect a .csv in --dir")
+    p = argparse.ArgumentParser(description="Apply Title, Keywords, and Description metadata to files based on a CSV.")
+    p.add_argument("--csv", required=False, help="Path to the CSV file (columns: Filename, Title, Keywords, Description). If omitted, will auto-detect a .csv in --dir")
     p.add_argument("--dir", default=".", help="Directory containing the target files (default: current directory)")
     p.add_argument("--encoding", default="utf-8-sig", help="CSV encoding (default: utf-8-sig, handles BOM)")
     p.add_argument("--delimiter", default=",", help="CSV delimiter (default: ,)")
@@ -100,6 +105,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="Show what would be written without changing files")
     p.add_argument("--recursive", action="store_true", help="(Not used) Placeholder for future recursion support")
     return p.parse_args()
+
+
+def normalize_column_name(name: str) -> str:
+    """Normalize column name: strip whitespace, remove special chars (*, ?), lowercase."""
+    if not name:
+        return ""
+    # Strip whitespace and remove common trailing markers (*, ?)
+    normalized = name.strip().rstrip("*?")
+    return normalized.lower()
+
+
+def find_column_key(available_keys: set, target_name: str) -> str | None:
+    """Find a column key in available_keys that matches target_name (case-insensitive, flexible)."""
+    target_normalized = normalize_column_name(target_name)
+    for key in available_keys:
+        if normalize_column_name(key) == target_normalized:
+            return key
+    return None
 
 
 def read_csv_rows(csv_path: Path, encoding: str, delimiter: str) -> List[Dict[str, str]]:
@@ -157,11 +180,37 @@ def main() -> None:
         print("CSV kosong atau tidak memiliki baris data.")
         return
 
-    required_cols = {"Filename", "Title", "Keywords"}
-    headers = set(rows[0].keys())
-    if not required_cols.issubset(headers):
-        print(f"Kolom CSV harus mengandung: {', '.join(sorted(required_cols))}. Ditemukan: {', '.join(sorted(headers))}")
+    # Find required columns using flexible matching (case-insensitive, ignores special chars)
+    available_keys = set(rows[0].keys())
+    filename_key = find_column_key(available_keys, "Filename")
+    title_key = find_column_key(available_keys, "Title")
+    keywords_key = find_column_key(available_keys, "Keywords")
+    description_key = find_column_key(available_keys, "Description")
+    
+    # Check required columns
+    missing = []
+    if not filename_key:
+        missing.append("Filename")
+    if not title_key:
+        missing.append("Title")
+    if not keywords_key:
+        missing.append("Keywords")
+    
+    if missing:
+        print(f"Kolom CSV harus mengandung: {', '.join(missing)}. Kolom yang ditemukan: {', '.join(sorted(available_keys))}")
         return
+    
+    # Description is optional; warn if missing but don't fail
+    if not description_key:
+        print("(Catatan: Kolom 'Description' tidak ditemukan. Metadata Description akan dilewati.)")
+    
+    # Store the actual column keys we'll use
+    column_map = {
+        "filename": filename_key,
+        "title": title_key,
+        "keywords": keywords_key,
+        "description": description_key
+    }
 
     total = len(rows)
     ok_count = 0
@@ -170,9 +219,11 @@ def main() -> None:
     details: List[str] = []
 
     for idx, row in enumerate(rows, start=1):
-        filename = row.get("Filename", "").strip()
-        title = row.get("Title", "").strip() or None
-        keywords = row.get("Keywords", "").strip() or None
+        # Use the mapped column keys (case-insensitive, flexible)
+        filename = row.get(column_map["filename"], "").strip()
+        title = row.get(column_map["title"], "").strip() or None
+        keywords = row.get(column_map["keywords"], "").strip() or None
+        description = (row.get(column_map["description"], "").strip() or None) if column_map["description"] else None
 
         # Normalize path separators potentially present in CSV (we expect just filenames)
         filename_only = Path(filename).name
@@ -186,7 +237,7 @@ def main() -> None:
             continue
 
         print(f"{header} — updating metadata…")
-        ok, msg = run_exiftool(args.exiftool, target, title, keywords, args.dry_run)
+        ok, msg = run_exiftool(args.exiftool, target, title, keywords, description, args.dry_run)
         if ok:
             print(f"   ✅ {target.name}: {msg}")
             ok_count += 1
